@@ -23,6 +23,10 @@ Each production now writes `timeline/timeline.json` as the single source of trut
 
 The same timeline is exported to `timeline/project.kdenlive` as MLT XML. The export includes an HD 1080p/25 fps profile, `qimage` and `avformat` producers, per-track playlists, a tractor/multitrack, `mix` transitions for audio tracks, `qtblend` graphics compositing, and `affine` keyframed geometry for slow push-in camera movement.
 
+## Creative memory
+
+Productions append to the persistent repository-level file `memory/creative_memory.json`. Each record stores the topic, timestamp, music preset, script sample, shot count, measured duration, word count, QC gate, and final monetization verdict. This provides an auditable history for future anti-repetition and creative-variation checks without overwriting earlier productions.
+
 ## Monetization gate
 
 A package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality is attested, commercial-use rights are complete, provenance is complete, the work has meaningful transformation, the project is not marked mass-produced, AI disclosure is configured, narration is present, research sources exist, and QC passes. Otherwise it is marked `NOT_ELIGIBLE` with explicit blocking reasons.

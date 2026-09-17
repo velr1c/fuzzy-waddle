@@ -467,6 +467,33 @@ def monetization_gate(project: Path, manifest, qc):
     return result
 
 
+def update_creative_memory(topic: str, timestamp: str, music_preset: str, script: str, shot_count: int, duration: float, qc_gate: str, monetization_verdict: str):
+    """Persist production history across runs without making unverifiable claims."""
+    path = ROOT / "memory" / "creative_memory.json"
+    existing = {"productions": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("productions"), list):
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {"productions": []}
+    record = {
+        "topic": topic,
+        "timestamp": timestamp,
+        "music_preset": music_preset,
+        "script_sample": script[:140],
+        "shot_count": int(shot_count),
+        "duration_seconds": round(float(duration), 3),
+        "words": len(re.findall(r"\b[\w'’-]+\b", script)),
+        "qc_gate": qc_gate,
+        "monetization_verdict": monetization_verdict,
+    }
+    existing["productions"].append(record)
+    write_json(path, existing)
+    return path, record
+
+
 def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_not_mass_produced=False, confirm_originality=True):
     slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:70] or "untitled"
     project = OUT / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
@@ -514,7 +541,8 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     qc = media_qc(video, narration, subtitles, manifest["provenance"]["complete"])
     write_json(package / "qc_report.json", qc)
     monetization = monetization_gate(project, manifest, qc)
-    print(json.dumps({"project": str(project), "package": str(package), "qc": qc["gate"], "monetization": monetization["decision"], "blocking_reasons": monetization["blocking_reasons"]}, indent=2))
+    memory_path, memory_record = update_creative_memory(topic, manifest["generated_at"], bus_info["music_preset"], shot_text, len(timeline["tracks"][0].get("clips", [])), measured_duration, qc["gate"], monetization["decision"])
+    print(json.dumps({"project": str(project), "package": str(package), "qc": qc["gate"], "monetization": monetization["decision"], "blocking_reasons": monetization["blocking_reasons"], "creative_memory": str(memory_path.relative_to(ROOT))}, indent=2))
 
 
 def main():
