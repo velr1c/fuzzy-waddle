@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+doctor_report.json
+out/
