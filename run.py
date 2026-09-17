@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Local-first AI YouTube Studio with an explicit monetization gate."""
 from __future__ import annotations
-import argparse, hashlib, json, re, shutil, subprocess, time
+import argparse, hashlib, json, math, re, shutil, subprocess, time, wave
 from pathlib import Path
+
+import numpy as np
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -165,7 +167,105 @@ def write_estimated_srt(text: str, duration: float, path: Path):
     path.write_text("\n".join(cues), encoding="utf-8")
 
 
-def create_video(project: Path, image: Path | None, narration: Path | None, subtitles: Path, duration=12):
+def write_wav(path: Path, samples: np.ndarray, sample_rate=44100):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.asarray(samples, dtype=np.float32)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak > 0.98:
+        samples = samples * (0.98 / peak)
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1); handle.setsampwidth(2); handle.setframerate(sample_rate)
+        handle.writeframes(pcm.tobytes())
+    return path
+
+
+def _audio_tone(duration, frequency, sample_rate=44100, amplitude=0.2, phase=0.0):
+    length = max(1, int(duration * sample_rate))
+    t = np.arange(length, dtype=np.float32) / sample_rate
+    return amplitude * np.sin(2 * np.pi * frequency * t + phase).astype(np.float32)
+
+
+def synth_music(duration, preset="neutral", seed=0, sample_rate=44100):
+    """Create deterministic, dependency-free music for the MUSIC bus."""
+    rng = np.random.default_rng(seed)
+    length = max(1, int(duration * sample_rate)); t = np.arange(length, dtype=np.float32) / sample_rate
+    settings = {"ambient_dark": (55, 0.16, 0.08), "curious_pulse": (110, 0.13, 0.16), "wonder": (220, 0.12, 0.10), "neutral": (165, 0.09, 0.10)}
+    root, level, pulse = settings.get(preset, settings["neutral"])
+    notes = [root, root * 1.25, root * 1.5, root * 2.0]
+    track = np.zeros(length, dtype=np.float32)
+    for index, note in enumerate(notes):
+        detune = 1.0 + float(rng.uniform(-0.006, 0.006))
+        track += (level / (index + 1)) * np.sin(2 * np.pi * note * detune * t + index * 0.7)
+    if pulse:
+        beat = np.maximum(0.0, np.sin(2 * np.pi * 1.5 * t)) ** 12
+        track += pulse * beat * np.sin(2 * np.pi * root * 0.5 * t)
+    fade = np.minimum(1.0, t / 0.8) * np.minimum(1.0, (duration - t) / 0.8)
+    return (track * np.clip(fade, 0, 1)).astype(np.float32)
+
+
+def synth_sfx(kind, duration, sample_rate=44100):
+    """Create a deterministic procedural SFX clip for the SFX bus."""
+    length = max(1, int(duration * sample_rate)); t = np.arange(length, dtype=np.float32) / sample_rate
+    seed = int(hashlib.sha256(kind.encode("utf-8")).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(length).astype(np.float32)
+    if kind == "whoosh":
+        sweep = 180 + 1200 * (t / max(duration, 0.001))
+        signal = np.sin(2 * np.pi * sweep * t) * np.linspace(0.05, 0.8, length)
+    elif kind == "impact":
+        signal = np.sin(2 * np.pi * 75 * t) * np.exp(-8 * t) + 0.25 * noise * np.exp(-18 * t)
+    elif kind == "riser":
+        signal = np.sin(2 * np.pi * (100 + 900 * (t / max(duration, 0.001))**2) * t) * np.linspace(0.02, 0.5, length)
+    else:  # static
+        signal = noise * 0.18 * np.exp(-2 * t)
+    return signal.astype(np.float32)
+
+
+def synth_ambience(duration, preset="space_hum", sample_rate=44100):
+    """Create a continuous low-level AMBIENCE bed."""
+    length = max(1, int(duration * sample_rate)); t = np.arange(length, dtype=np.float32) / sample_rate
+    rng = np.random.default_rng(2309 if preset == "space_hum" else 731)
+    hum = 0.035 * np.sin(2 * np.pi * (42 if preset == "space_hum" else 90) * t)
+    bed = 0.012 * rng.standard_normal(length).astype(np.float32)
+    return (hum + bed).astype(np.float32)
+
+
+def read_wav(path: Path, target_rate=44100):
+    with wave.open(str(path), "rb") as handle:
+        rate, channels, width = handle.getframerate(), handle.getnchannels(), handle.getsampwidth()
+        frames = handle.readframes(handle.getnframes())
+    if width != 2:
+        raise ValueError("Only 16-bit WAV input is supported")
+    data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+    if rate != target_rate and data.size > 1:
+        old_x = np.linspace(0, 1, data.size); new_size = max(1, int(data.size * target_rate / rate))
+        data = np.interp(np.linspace(0, 1, new_size), old_x, data).astype(np.float32)
+    return data
+
+
+def mix_audio_buses(package: Path, duration: float, narration: Path | None, topic: str):
+    """Mix VOICE + MUSIC + SFX + AMBIENCE with voice-driven ducking."""
+    rate = 44100; length = max(1, int(duration * rate)); seed = int(hashlib.sha256(topic.encode()).hexdigest()[:8], 16)
+    voice = np.zeros(length, dtype=np.float32)
+    if narration and narration.exists():
+        source = read_wav(narration, rate); voice[:min(length, len(source))] = source[:length]
+    music = synth_music(duration, "curious_pulse", seed, rate)
+    ambience = synth_ambience(duration, "space_hum", rate)
+    sfx = np.zeros(length, dtype=np.float32)
+    for start, kind, clip_duration in ((0.15, "whoosh", 0.35), (duration * 0.48, "impact", 0.25), (max(0, duration - 0.7), "riser", 0.6)):
+        clip = synth_sfx(kind, clip_duration, rate); offset = min(length, max(0, int(start * rate)))
+        end = min(length, offset + len(clip)); sfx[offset:end] += clip[:end - offset]
+    voice_energy = np.convolve(np.abs(voice), np.ones(max(1, int(rate * 0.15)), dtype=np.float32) / max(1, int(rate * 0.15)), mode="same")
+    duck = np.clip(1.0 - 0.55 * (voice_energy / max(0.15, float(np.max(voice_energy)))), 0.35, 1.0)
+    mixed = voice * 1.0 + music * duck * 0.55 + ambience * duck * 0.8 + sfx * 0.65
+    mix_path = write_wav(package / "final_mix.wav", mixed, rate)
+    return mix_path, {"voice": bool(narration), "music": True, "sfx": True, "ambience": True, "music_preset": "curious_pulse", "sfx_events": 3, "sample_rate": rate, "sidechain_ducking": True}
+
+
+def create_video(project: Path, image: Path | None, mix: Path | None, subtitles: Path, duration=12):
     video = project / "package" / "final_video.mp4"
     if not tool("ffmpeg") or image is None:
         return None, "ffmpeg or image unavailable"
@@ -173,10 +273,10 @@ def create_video(project: Path, image: Path | None, narration: Path | None, subt
     subtitle_filter = f"subtitles={str(subtitles).replace('\\', '/').replace(':', '\\:')}"
     vf = f"format=yuv420p,{subtitle_filter}" if subtitles.exists() and subtitles.stat().st_size else "format=yuv420p"
     cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image)]
-    if narration:
-        cmd += ["-i", str(narration)]
+    if mix:
+        cmd += ["-i", str(mix)]
     cmd += ["-t", str(duration), "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p"]
-    if narration:
+    if mix:
         cmd += ["-c:a", "aac", "-shortest"]
     else:
         cmd += ["-an"]
@@ -279,7 +379,8 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     narration_duration = probe_duration(narration) if narration else None
     measured_duration = narration_duration or float(shot_duration)
     subtitles = package / "subtitles.srt"; write_estimated_srt(shot_text, measured_duration, subtitles)
-    video, video_error = create_video(project, image, narration, subtitles, measured_duration)
+    final_mix, bus_info = mix_audio_buses(package, measured_duration, narration, topic)
+    video, video_error = create_video(project, image, final_mix, subtitles, measured_duration)
     files = []
     for path in project.rglob("*"):
         if path.is_file() and path.name not in {"production_manifest.json", "qc_report.json", "monetization_report.json"}:
@@ -289,7 +390,7 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
         "research": {"source_count": len(claims), "source_status": source["status"], "claims_count": len(claims)},
         "creative": {"originality_attested": bool(confirm_originality), "meaningful_transformation": True, "not_mass_produced": bool(confirm_not_mass_produced), "human_review_required": True, "attested_by_operator": bool(confirm_not_mass_produced)},
         "rights": {"originality_attested": bool(confirm_originality), "commercial_rights_complete": bool(confirm_commercial_rights), "attested_by_operator": bool(confirm_commercial_rights), "rights_policy": "Every external asset requires documented commercial-use rights."},
-        "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "MISSING", "sfx_status": "MISSING"},
+        "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "REAL/LOCAL/FREE", "music_preset": bus_info["music_preset"], "sfx_status": "REAL/LOCAL/FREE", "sfx_events": bus_info["sfx_events"], "ambience_status": "REAL/LOCAL/FREE", "final_mix_path": "package/final_mix.wav", "sidechain_ducking": bus_info["sidechain_ducking"]},
         "subtitles": {"status": "SIMULATED", "subtitles_timing_source": "script_estimated", "path": "package/subtitles.srt"},
         "disclosure": {"ai_use_disclosure_configured": True, "realistic_ai_content": True, "upload_setting_required": True},
         "provenance": {"complete": True, "asset_count": len(files)}, "render": {"video_status": "REAL/LOCAL/FREE" if video else "MISSING", "error": video_error}, "assets": files,

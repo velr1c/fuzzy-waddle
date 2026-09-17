@@ -15,6 +15,8 @@ The output is written under `out/<timestamp>-<topic>/package/` and includes a vi
 
 When `espeak-ng` or a configured Piper model is available, the studio synthesizes `narration.wav`, measures its duration, muxes it into the MP4, and burns the generated SRT captions. Without a local TTS provider, it produces a silent, captioned animatic and honestly fails the narration gate.
 
+The audio stage now creates four buses without external Python audio dependencies: `VOICE`, deterministic NumPy `MUSIC` (with `ambient_dark`, `curious_pulse`, `wonder`, and `neutral` presets), procedural `SFX` (whoosh, impact, riser, and static), and continuous `AMBIENCE`. Voice-driven sidechain ducking is applied to music and ambience, and the result is written to `package/final_mix.wav` before FFmpeg muxing.
+
 ## Monetization gate
 
 A package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality is attested, commercial-use rights are complete, provenance is complete, the work has meaningful transformation, the project is not marked mass-produced, AI disclosure is configured, narration is present, research sources exist, and QC passes. Otherwise it is marked `NOT_ELIGIBLE` with explicit blocking reasons.
