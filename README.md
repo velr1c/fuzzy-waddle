@@ -1,71 +1,213 @@
 # AI YouTube Studio
 
-A local-first, honest production pipeline for turning a topic into a reviewable YouTube package. This repository treats monetization as a **hard readiness gate**, not as a promise of YouTube Partner Program approval.
+A local-first, AI-assisted YouTube production pipeline with an explicit monetization-readiness gate. Topic in; a reviewable production package out. The system is designed to be honest about local capabilities and never promises YouTube Partner Program approval, copyright clearance, advertiser suitability, or revenue.
 
-## Run
+## Installation
+
+```bash
+git clone https://github.com/velr1c/fuzzy-waddle.git
+cd fuzzy-waddle
+pip install numpy Pillow
+```
+
+Recommended local tools:
+
+```bash
+sudo apt install ffmpeg espeak-ng kdenlive melt
+```
+
+Piper can be added separately with a compatible local voice model. The pipeline probes capabilities at runtime and never silently substitutes a missing provider.
+
+## Quick start
 
 ```bash
 python3 run.py doctor
-python3 run.py produce --topic "The Fermi Paradox" --minutes 1 \
+python3 run.py produce --topic "The Fermi Paradox" --minutes 2 \
   --confirm-commercial-rights \
   --confirm-not-mass-produced
+python3 run.py variants --topic "The Fermi Paradox" --n 3
+python3 run.py resume --project-dir out/<project-dir>
 ```
 
-The output is written under `out/<timestamp>-<topic>/package/` and includes a video when FFmpeg and Pillow are available, source-backed research files, storyboard, title, description, chapters, subtitles, `production_manifest.json`, `qc_report.json`, and `monetization_report.json`.
+## Pipeline stages
 
-When `espeak-ng` or a configured Piper model is available, the studio synthesizes `narration.wav`, measures its duration, muxes it into the MP4, and burns the generated SRT captions. Without a local TTS provider, it produces a silent, captioned animatic and honestly fails the narration gate.
+### 1. Research
 
-The audio stage now creates four buses without external Python audio dependencies: `VOICE`, deterministic NumPy `MUSIC` (with `ambient_dark`, `curious_pulse`, `wonder`, and `neutral` presets), procedural `SFX` (whoosh, impact, riser, and static), and continuous `AMBIENCE`. Voice-driven sidechain ducking is applied to music and ambience, and the result is written to `package/final_mix.wav` before FFmpeg muxing.
+Wikipedia-backed research produces `sources.json` and source-linked `claims.json` with retrieval status and confidence labels.
 
-## Canonical timeline
+### 2. Creative and visual production
 
-Each production now writes `timeline/timeline.json` as the single source of truth. It contains eight tracks—`VIDEO`, `GRAPHICS`, `VOICE`, `MUSIC`, `SFX`, `AMBIENCE`, `SUBTITLES`, and `TRANSITIONS`—with source-relative clip references, measured narration timing when available, 25 fps, and a 1920x1080 canvas. Individual bus artifacts are retained alongside `final_mix.wav` so later renderers can rebuild or inspect the mix.
+The MVP creates an original explainer script, storyboard, and procedural title-card visual at `assets/shot_001.png`.
 
-The same timeline is exported to `timeline/project.kdenlive` as MLT XML. The export includes an HD 1080p/25 fps profile, `qimage` and `avformat` producers, per-track playlists, a tractor/multitrack, `mix` transitions for audio tracks, `qtblend` graphics compositing, and `affine` keyframed geometry for slow push-in camera movement.
+### 3. Audio buses
+
+Four parallel buses are generated locally when possible:
+
+- **VOICE**: narration through `espeak-ng` or a configured Piper model.
+- **MUSIC**: deterministic NumPy synthesis with `ambient_dark`, `curious_pulse`, `wonder`, and `neutral` presets.
+- **SFX**: procedural whoosh, impact, riser, and static effects.
+- **AMBIENCE**: continuous procedural room tone or space hum.
+
+Voice-driven sidechain ducking reduces music and ambience beneath narration. The package retains `narration.wav`, `music.wav`, `sfx_*.wav`, `ambience.wav`, and `final_mix.wav`.
+
+### 4. Subtitles and render
+
+Subtitles are generated from script-estimated timing and labeled `SIMULATED` because timing is not measured by STT. FFmpeg burns captions into the final MP4 and muxes the mixed audio.
+
+### 5. Canonical timeline
+
+`timeline/timeline.json` is the production source of truth with eight tracks: `VIDEO`, `GRAPHICS`, `VOICE`, `MUSIC`, `SFX`, `AMBIENCE`, `SUBTITLES`, and `TRANSITIONS`. It records 25 FPS, a 1920×1080 canvas, source-relative clips, measured narration timing, camera motion parameters, and audio events.
+
+### 6. Kdenlive export
+
+`kdenlive/project.kdenlive` is generated as MLT XML for Kdenlive 23.x–26.x. It includes `qimage` and `avformat` producers, playlists, tractor/multitrack, audio `mix` transitions, `qtblend` compositing, and affine keyframed camera geometry. If `melt` is installed, a null-consumer validation is attempted and recorded as `LOCAL`; otherwise the written XML is marked `SIMULATED`.
+
+### 7. QC
+
+The QC report checks decode probe, narration, non-empty subtitles, provenance, EBU R128 loudness, black frames, silence ratio, and decode errors. WARN results do not block; hard FAIL results do.
+
+### 8. Monetization-readiness gate
+
+The package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality, commercial rights, provenance, meaningful transformation, non-mass-production attestation, AI disclosure, narration, research, and QC all pass. Otherwise it returns `NOT_ELIGIBLE` with explicit blocking reasons.
 
 ## Creative memory
 
-Productions append to the persistent shared file `out/creative_memory.json`. Each record stores the topic, timestamp, music preset, script sample, shot count, measured duration, word count, QC gate, and final monetization verdict. The pipeline computes topic Jaccard similarity, tracks preset usage, rotates away from presets used in the last three productions when possible, and records repetition warnings without pretending that similarity analysis proves originality.
+`out/creative_memory.json` persists across projects and records each production’s topic, timestamp, music preset, script sample, shot count, duration, word count, QC gate, and monetization verdict. The pipeline computes topic Jaccard similarity, tracks preset usage, rotates away from presets used in the last three productions when possible, and records repetition warnings above 0.8 similarity. Similarity analysis is an aid to review, not proof of originality.
 
-## Variants and resume
+## Variants
 
-Variants mode generates only a scoring report; it does not render video:
+Variants mode does not render video:
 
 ```bash
 python3 run.py variants --topic "The Fermi Paradox" --n 3
 ```
 
-Each concept varies its opening hook, music preset, and SFX pattern, then scores originality, music diversity, research coverage, and a composite recommendation.
+It varies hook template, music preset, and SFX pattern, then scores each concept using:
 
-Resume mode reports stage status and reruns missing render, QC, and monetization work while preserving completed artifacts:
-
-```bash
-python3 run.py resume --project-dir out/<project>
+```text
+0.4 * originality + 0.3 * music diversity + 0.3 * research coverage
 ```
 
-Kdenlive output is written to `kdenlive/project.kdenlive`. If `melt` is available, the exporter attempts a null-consumer validation and records `LOCAL` with `validated_by: "melt"` on success. Without `melt`, the XML is retained and honestly marked `SIMULATED`.
+The JSON report includes the recommended index and preset.
 
-## Monetization gate
+## Resume
 
-A package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality is attested, commercial-use rights are complete, provenance is complete, the work has meaningful transformation, the project is not marked mass-produced, AI disclosure is configured, narration is present, research sources exist, and QC passes. Otherwise it is marked `NOT_ELIGIBLE` with explicit blocking reasons.
+Resume checks completed artifacts and reports `SKIP` versus `RUN` for research, creative, voice, mixing, timeline, Kdenlive, render, QC, and monetization. If an upstream output such as the final video is removed, downstream QC and monetization are invalidated and rerun.
 
-This implements a conservative production-readiness check informed by [YouTube channel monetization policies](https://support.google.com/youtube/answer/1311392), [what content can be monetized](https://support.google.com/youtube/answer/2490020), and [AI disclosure guidance](https://support.google.com/youtube/answer/14328491). It cannot guarantee acceptance into YPP, advertiser suitability, copyright clearance, or revenue.
+```bash
+python3 run.py resume --project-dir out/<project-dir>
+```
 
 ## Human attestation
 
-The production gate is intentionally not one-way. An operator must explicitly attest to facts the software cannot prove:
+These flags record operator attestations that software cannot prove:
 
-```bash
+```text
 --confirm-commercial-rights
 --confirm-not-mass-produced
+--no-originality
 ```
 
-Originality is enabled by default for this local-original workflow. Use `--no-originality` for defensive testing. These flags record `attested_by_operator: true`; they do not waive copyright, rights-clearance, or YouTube review requirements.
+Attestation does not waive copyright obligations or guarantee platform approval.
 
 ## Honesty contract
 
-Artifacts are labeled as `REAL/LOCAL/FREE`, `SIMULATED`, `MISSING`, or `PAID_BLOCKED`. Missing narration, rights evidence, or QC never gets silently replaced with a fake success state.
+Every capability is represented as one of:
 
-## Current scope
+- **REAL/LOCAL/FREE** — it actually worked with local or free tools.
+- **SIMULATED** — a development substitute or estimated result.
+- **MISSING** — unavailable and not produced.
+- **PAID_BLOCKED** — intentionally blocked because it requires paid access.
 
-The MVP implements runtime capability probing, Wikipedia research, source-backed claims, a procedural visual, local TTS when available, measured narration duration, estimated SRT subtitles, FFmpeg audio/caption muxing, asset hashes, expanded loudness/black-frame/silence/decode QC, a production manifest, and the monetization gate. Future work can add local STT timing, canonical multi-track timelines, MLT/Kdenlive export, audio buses, richer craft modules, creative-memory similarity checks, and a human review UI.
+`production_manifest.json` includes an `honesty.non_ok` list. Missing narration produces a silent animatic and fails publication QC; it is never presented as a narrated success.
+
+## Output layout
+
+```text
+out/<timestamp>-<topic>/
+├── sources.json
+├── claims.json
+├── script.txt
+├── storyboard.json
+├── assets/shot_001.png
+├── package/
+│   ├── narration.wav
+│   ├── music.wav
+│   ├── sfx_whoosh.wav
+│   ├── sfx_impact.wav
+│   ├── sfx_riser.wav
+│   ├── ambience.wav
+│   ├── final_mix.wav
+│   ├── subtitles.srt
+│   ├── final_video.mp4
+│   ├── qc_report.json
+│   └── monetization_report.json
+├── timeline/timeline.json
+├── kdenlive/project.kdenlive
+└── production_manifest.json
+```
+
+The shared memory file is `out/creative_memory.json`.
+
+## Examples
+
+Executable examples are in `examples/`:
+
+```bash
+./examples/fermi_paradox.sh
+./examples/variants.sh
+./examples/resume.sh out/<project-dir>
+```
+
+## Troubleshooting
+
+### `espeak-ng not found`
+
+Install `sudo apt install espeak-ng` on Ubuntu/Debian or `brew install espeak-ng` on macOS. Without TTS, the system honestly creates a silent animatic and fails the narration gate.
+
+### `piper not found`
+
+Install Piper and configure a local `.onnx` voice model. The pipeline only uses Piper when its executable and model are available.
+
+### `ffmpeg not found`
+
+Install `sudo apt install ffmpeg` or `brew install ffmpeg`. Rendering and media QC require FFmpeg.
+
+### `melt not found`
+
+Install Kdenlive, which provides `melt` on many distributions. Without it, Kdenlive XML is retained and marked `SIMULATED`, not falsely marked validated.
+
+### Monetization returns `NOT_ELIGIBLE`
+
+Inspect `package/monetization_report.json`. Common causes are missing commercial-rights or non-mass-produced attestations, missing narration, missing research, or QC failure.
+
+### Video is silent
+
+A local TTS provider was unavailable. Install `espeak-ng` or configure Piper, then use `resume` or rerun production.
+
+### Subtitle timing says `script_estimated`
+
+This is expected. Real subtitle timing requires STT measurement with Whisper or another local recognizer; estimated timing remains explicitly labeled.
+
+## Testing
+
+```bash
+python3 -m py_compile run.py
+python3 run.py doctor
+python3 run.py produce --topic "Test Topic" --minutes 1 \
+  --confirm-commercial-rights --confirm-not-mass-produced
+python3 run.py variants --topic "Test Topic" --n 3
+python3 run.py resume --project-dir out/<project-dir>
+```
+
+## Limitations and future work
+
+The current implementation uses a single procedural shot, simple explainer scripts, estimated subtitle timing, procedural audio, and no true multi-shot VFX or motion-graphics authoring. Future work could add local LLM scripting, Whisper timing, ComfyUI visuals, multi-shot storyboards, advanced motion graphics, and licensed music workflows.
+
+## Monetization disclaimer
+
+The monetization gate is a conservative production-readiness check, not a guarantee of YouTube Partner Program approval. YouTube policies can change and are applied by platform reviewers. This software cannot guarantee YPP acceptance, certify copyright clearance, predict advertiser suitability, or promise revenue.
+
+## License
+
+MIT
