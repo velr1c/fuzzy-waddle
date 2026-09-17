@@ -255,14 +255,40 @@ def mix_audio_buses(package: Path, duration: float, narration: Path | None, topi
     music = synth_music(duration, "curious_pulse", seed, rate)
     ambience = synth_ambience(duration, "space_hum", rate)
     sfx = np.zeros(length, dtype=np.float32)
+    sfx_events = []
     for start, kind, clip_duration in ((0.15, "whoosh", 0.35), (duration * 0.48, "impact", 0.25), (max(0, duration - 0.7), "riser", 0.6)):
         clip = synth_sfx(kind, clip_duration, rate); offset = min(length, max(0, int(start * rate)))
         end = min(length, offset + len(clip)); sfx[offset:end] += clip[:end - offset]
+        sfx_events.append({"start": round(float(start), 3), "duration": clip_duration, "type": kind})
+    music_path = write_wav(package / "music.wav", music, rate)
+    ambience_path = write_wav(package / "ambience.wav", ambience, rate)
+    sfx_paths = {}
+    for event in sfx_events:
+        sfx_paths[event["type"]] = write_wav(package / f"sfx_{event['type']}.wav", synth_sfx(event["type"], event["duration"], rate), rate)
     voice_energy = np.convolve(np.abs(voice), np.ones(max(1, int(rate * 0.15)), dtype=np.float32) / max(1, int(rate * 0.15)), mode="same")
     duck = np.clip(1.0 - 0.55 * (voice_energy / max(0.15, float(np.max(voice_energy)))), 0.35, 1.0)
     mixed = voice * 1.0 + music * duck * 0.55 + ambience * duck * 0.8 + sfx * 0.65
     mix_path = write_wav(package / "final_mix.wav", mixed, rate)
-    return mix_path, {"voice": bool(narration), "music": True, "sfx": True, "ambience": True, "music_preset": "curious_pulse", "sfx_events": 3, "sample_rate": rate, "sidechain_ducking": True}
+    return mix_path, {"voice": bool(narration), "music": True, "music_path": "package/music.wav", "sfx": True, "sfx_events": sfx_events, "sfx_paths": {k: f"package/sfx_{k}.wav" for k in sfx_paths}, "ambience": True, "ambience_path": "package/ambience.wav", "music_preset": "curious_pulse", "sample_rate": rate, "sidechain_ducking": True}
+
+
+def create_timeline(project: Path, topic: str, duration: float, image: Path | None, narration: Path | None, narration_duration: float | None, bus_info, subtitles: Path):
+    """Write the canonical single-source-of-truth timeline for all production tracks."""
+    timeline_dir = project / "timeline"; timeline_dir.mkdir(parents=True, exist_ok=True)
+    image_src = str(image.relative_to(project)) if image else ""
+    tracks = [
+        {"id": "video", "kind": "VIDEO", "clips": [{"start": 0.0, "duration": duration, "src": image_src, "params": {"move": "slow_push_in", "z0": 1.0, "z1": 1.14}}]},
+        {"id": "graphics", "kind": "GRAPHICS", "clips": []},
+        {"id": "voice", "kind": "VOICE", "clips": ([{"start": 0.0, "duration": narration_duration or duration, "src": "package/narration.wav", "status": "REAL/LOCAL/FREE"}] if narration else [])},
+        {"id": "music", "kind": "MUSIC", "clips": [{"start": 0.0, "duration": duration, "src": "package/music.wav", "preset": bus_info["music_preset"]}]},
+        {"id": "sfx", "kind": "SFX", "clips": [{"start": e["start"], "duration": e["duration"], "src": bus_info["sfx_paths"][e["type"]], "type": e["type"]} for e in bus_info["sfx_events"]]},
+        {"id": "ambience", "kind": "AMBIENCE", "clips": [{"start": 0.0, "duration": duration, "src": bus_info["ambience_path"], "kind": "space_hum"}]},
+        {"id": "subtitles", "kind": "SUBTITLES", "meta": {"srt": "package/subtitles.srt", "timing_source": "script_estimated", "cue_count": len([x for x in subtitles.read_text(encoding="utf-8").split("\n\n") if x.strip()])}},
+        {"id": "transitions", "kind": "TRANSITIONS", "clips": []},
+    ]
+    payload = {"project_id": project.name, "fps": 25, "width": 1920, "height": 1080, "duration": duration, "tracks": tracks, "meta": {"topic": topic, "timing_basis": "measured_narration" if narration_duration else "requested_duration", "transition_mode": "xfade"}}
+    path = timeline_dir / "timeline.json"; write_json(path, payload)
+    return path, payload
 
 
 def create_video(project: Path, image: Path | None, mix: Path | None, subtitles: Path, duration=12):
@@ -380,6 +406,7 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     measured_duration = narration_duration or float(shot_duration)
     subtitles = package / "subtitles.srt"; write_estimated_srt(shot_text, measured_duration, subtitles)
     final_mix, bus_info = mix_audio_buses(package, measured_duration, narration, topic)
+    timeline_path, timeline = create_timeline(project, topic, measured_duration, image, narration, narration_duration, bus_info, subtitles)
     video, video_error = create_video(project, image, final_mix, subtitles, measured_duration)
     files = []
     for path in project.rglob("*"):
@@ -390,7 +417,8 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
         "research": {"source_count": len(claims), "source_status": source["status"], "claims_count": len(claims)},
         "creative": {"originality_attested": bool(confirm_originality), "meaningful_transformation": True, "not_mass_produced": bool(confirm_not_mass_produced), "human_review_required": True, "attested_by_operator": bool(confirm_not_mass_produced)},
         "rights": {"originality_attested": bool(confirm_originality), "commercial_rights_complete": bool(confirm_commercial_rights), "attested_by_operator": bool(confirm_commercial_rights), "rights_policy": "Every external asset requires documented commercial-use rights."},
-        "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "REAL/LOCAL/FREE", "music_preset": bus_info["music_preset"], "sfx_status": "REAL/LOCAL/FREE", "sfx_events": bus_info["sfx_events"], "ambience_status": "REAL/LOCAL/FREE", "final_mix_path": "package/final_mix.wav", "sidechain_ducking": bus_info["sidechain_ducking"]},
+        "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "REAL/LOCAL/FREE", "music_preset": bus_info["music_preset"], "sfx_status": "REAL/LOCAL/FREE", "sfx_events": len(bus_info["sfx_events"]), "ambience_status": "REAL/LOCAL/FREE", "final_mix_path": "package/final_mix.wav", "sidechain_ducking": bus_info["sidechain_ducking"]},
+        "timeline": {"path": "timeline/timeline.json", "fps": timeline["fps"], "width": timeline["width"], "height": timeline["height"], "track_count": len(timeline["tracks"])},
         "subtitles": {"status": "SIMULATED", "subtitles_timing_source": "script_estimated", "path": "package/subtitles.srt"},
         "disclosure": {"ai_use_disclosure_configured": True, "realistic_ai_content": True, "upload_setting_required": True},
         "provenance": {"complete": True, "asset_count": len(files)}, "render": {"video_status": "REAL/LOCAL/FREE" if video else "MISSING", "error": video_error}, "assets": files,

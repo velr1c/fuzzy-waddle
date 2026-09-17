@@ -17,6 +17,10 @@ When `espeak-ng` or a configured Piper model is available, the studio synthesize
 
 The audio stage now creates four buses without external Python audio dependencies: `VOICE`, deterministic NumPy `MUSIC` (with `ambient_dark`, `curious_pulse`, `wonder`, and `neutral` presets), procedural `SFX` (whoosh, impact, riser, and static), and continuous `AMBIENCE`. Voice-driven sidechain ducking is applied to music and ambience, and the result is written to `package/final_mix.wav` before FFmpeg muxing.
 
+## Canonical timeline
+
+Each production now writes `timeline/timeline.json` as the single source of truth. It contains eight tracks—`VIDEO`, `GRAPHICS`, `VOICE`, `MUSIC`, `SFX`, `AMBIENCE`, `SUBTITLES`, and `TRANSITIONS`—with source-relative clip references, measured narration timing when available, 25 fps, and a 1920x1080 canvas. Individual bus artifacts are retained alongside `final_mix.wav` so later renderers can rebuild or inspect the mix.
+
 ## Monetization gate
 
 A package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality is attested, commercial-use rights are complete, provenance is complete, the work has meaningful transformation, the project is not marked mass-produced, AI disclosure is configured, narration is present, research sources exist, and QC passes. Otherwise it is marked `NOT_ELIGIBLE` with explicit blocking reasons.
