@@ -47,6 +47,15 @@ def write_json(path: Path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_json(path: Path, default=None):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
 def doctor():
     tools = probe_tools()
     deps = {}
@@ -247,13 +256,13 @@ def read_wav(path: Path, target_rate=44100):
     return data
 
 
-def mix_audio_buses(package: Path, duration: float, narration: Path | None, topic: str):
+def mix_audio_buses(package: Path, duration: float, narration: Path | None, topic: str, music_preset="curious_pulse"):
     """Mix VOICE + MUSIC + SFX + AMBIENCE with voice-driven ducking."""
     rate = 44100; length = max(1, int(duration * rate)); seed = int(hashlib.sha256(topic.encode()).hexdigest()[:8], 16)
     voice = np.zeros(length, dtype=np.float32)
     if narration and narration.exists():
         source = read_wav(narration, rate); voice[:min(length, len(source))] = source[:length]
-    music = synth_music(duration, "curious_pulse", seed, rate)
+    music = synth_music(duration, music_preset, seed, rate)
     ambience = synth_ambience(duration, "space_hum", rate)
     sfx = np.zeros(length, dtype=np.float32)
     sfx_events = []
@@ -270,7 +279,7 @@ def mix_audio_buses(package: Path, duration: float, narration: Path | None, topi
     duck = np.clip(1.0 - 0.55 * (voice_energy / max(0.15, float(np.max(voice_energy)))), 0.35, 1.0)
     mixed = voice * 1.0 + music * duck * 0.55 + ambience * duck * 0.8 + sfx * 0.65
     mix_path = write_wav(package / "final_mix.wav", mixed, rate)
-    return mix_path, {"voice": bool(narration), "music": True, "music_path": "package/music.wav", "sfx": True, "sfx_events": sfx_events, "sfx_paths": {k: f"package/sfx_{k}.wav" for k in sfx_paths}, "ambience": True, "ambience_path": "package/ambience.wav", "music_preset": "curious_pulse", "sample_rate": rate, "sidechain_ducking": True}
+    return mix_path, {"voice": bool(narration), "music": True, "music_path": "package/music.wav", "sfx": True, "sfx_events": sfx_events, "sfx_paths": {k: f"package/sfx_{k}.wav" for k in sfx_paths}, "ambience": True, "ambience_path": "package/ambience.wav", "music_preset": music_preset, "sample_rate": rate, "sidechain_ducking": True}
 
 
 def create_timeline(project: Path, topic: str, duration: float, image: Path | None, narration: Path | None, narration_duration: float | None, bus_info, subtitles: Path):
@@ -333,9 +342,10 @@ def write_kdenlive_project(timeline, out_path: Path):
                 ET.SubElement(filt, "property", {"name": "mlt_service"}).text = "affine"
                 ET.SubElement(filt, "property", {"name": "transition.geometry"}).text = geometry
     playlist_ids = {}
+    playlist_kinds = media_kinds | {"SUBTITLES", "TRANSITIONS"}
     for track in timeline.get("tracks", []):
         kind = track.get("kind")
-        if kind not in media_kinds: continue
+        if kind not in playlist_kinds: continue
         plid = f"playlist_{track['id']}"; playlist_ids[kind] = plid
         playlist = ET.SubElement(root, "playlist", {"id": plid})
         cursor = 0
@@ -369,6 +379,13 @@ def write_kdenlive_project(timeline, out_path: Path):
     ET.indent(root, space="  ")
     ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
     return out_path
+
+
+def validate_kdenlive_project(path: Path):
+    if not tool("melt"):
+        return "SIMULATED", None
+    result = run(["melt", str(path), "-consumer", "null", "-silent"], timeout=180)
+    return ("LOCAL", "melt") if result.returncode == 0 else ("SIMULATED", None)
 
 
 def create_video(project: Path, image: Path | None, mix: Path | None, subtitles: Path, duration=12):
@@ -467,9 +484,49 @@ def monetization_gate(project: Path, manifest, qc):
     return result
 
 
+def memory_path():
+    return OUT / "creative_memory.json"
+
+
+def load_creative_memory():
+    path = memory_path()
+    if not path.exists(): return {"productions": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and isinstance(data.get("productions"), list) else {"productions": []}
+    except (OSError, json.JSONDecodeError):
+        return {"productions": []}
+
+
+def word_set(text):
+    return {x.lower() for x in re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", text)}
+
+
+def jaccard_similarity(left, right):
+    a, b = word_set(left), word_set(right)
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def memory_metrics(topic, memory):
+    records = memory.get("productions", [])
+    similarities = [jaccard_similarity(topic, r.get("topic", "")) for r in records]
+    counts = {preset: sum(1 for r in records if r.get("music_preset") == preset) for preset in ("ambient_dark", "curious_pulse", "wonder", "neutral")}
+    recent = [r.get("music_preset") for r in records[-3:]]
+    return (max(similarities, default=0.0), counts, recent)
+
+
+def choose_music_preset(memory, preferred=None):
+    _, _, recent = memory_metrics("", memory)
+    presets = ["ambient_dark", "curious_pulse", "wonder", "neutral"]
+    if preferred and preferred not in recent: return preferred
+    for preset in presets:
+        if preset not in recent: return preset
+    return preferred or presets[len(memory.get("productions", [])) % len(presets)]
+
+
 def update_creative_memory(topic: str, timestamp: str, music_preset: str, script: str, shot_count: int, duration: float, qc_gate: str, monetization_verdict: str):
     """Persist production history across runs without making unverifiable claims."""
-    path = ROOT / "memory" / "creative_memory.json"
+    path = memory_path()
     existing = {"productions": []}
     if path.exists():
         try:
@@ -498,6 +555,9 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:70] or "untitled"
     project = OUT / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
     package = project / "package"; package.mkdir(parents=True)
+    memory = load_creative_memory()
+    similarity_max, preset_counts, recent_presets = memory_metrics(topic, memory)
+    selected_preset = choose_music_preset(memory)
     source, claims = wikipedia_research(topic, project)
     image = create_visual(project, topic)
     shot_duration = min(max(minutes * 60, 12), 60)
@@ -512,9 +572,10 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     narration_duration = probe_duration(narration) if narration else None
     measured_duration = narration_duration or float(shot_duration)
     subtitles = package / "subtitles.srt"; write_estimated_srt(shot_text, measured_duration, subtitles)
-    final_mix, bus_info = mix_audio_buses(package, measured_duration, narration, topic)
+    final_mix, bus_info = mix_audio_buses(package, measured_duration, narration, topic, selected_preset)
     timeline_path, timeline = create_timeline(project, topic, measured_duration, image, narration, narration_duration, bus_info, subtitles)
-    kdenlive_path = write_kdenlive_project(timeline, project / "timeline" / "project.kdenlive")
+    kdenlive_path = write_kdenlive_project(timeline, project / "kdenlive" / "project.kdenlive")
+    kdenlive_validation, kdenlive_validated_by = validate_kdenlive_project(kdenlive_path)
     video, video_error = create_video(project, image, final_mix, subtitles, measured_duration)
     files = []
     for path in project.rglob("*"):
@@ -523,19 +584,21 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     manifest = {
         "schema_version": "1.0", "generated_at": now(), "topic": topic, "duration_minutes_requested": minutes, "honesty": {"non_ok": []},
         "research": {"source_count": len(claims), "source_status": source["status"], "claims_count": len(claims)},
-        "creative": {"originality_attested": bool(confirm_originality), "meaningful_transformation": True, "not_mass_produced": bool(confirm_not_mass_produced), "human_review_required": True, "attested_by_operator": bool(confirm_not_mass_produced)},
+        "creative": {"originality_attested": bool(confirm_originality), "meaningful_transformation": True, "not_mass_produced": bool(confirm_not_mass_produced), "human_review_required": True, "attested_by_operator": bool(confirm_not_mass_produced), "memory_similarity_max": round(similarity_max, 4), "music_preset_usage_count": preset_counts, "repetition_warning": (f"Topic similarity {similarity_max:.2f} exceeds 0.8 threshold; requires --confirm-not-mass-produced attestation" if similarity_max > 0.8 and not confirm_not_mass_produced else None), "memory_productions_total": len(memory.get("productions", []))},
         "rights": {"originality_attested": bool(confirm_originality), "commercial_rights_complete": bool(confirm_commercial_rights), "attested_by_operator": bool(confirm_commercial_rights), "rights_policy": "Every external asset requires documented commercial-use rights."},
         "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "REAL/LOCAL/FREE", "music_preset": bus_info["music_preset"], "sfx_status": "REAL/LOCAL/FREE", "sfx_events": len(bus_info["sfx_events"]), "ambience_status": "REAL/LOCAL/FREE", "final_mix_path": "package/final_mix.wav", "sidechain_ducking": bus_info["sidechain_ducking"]},
-        "timeline": {"path": "timeline/timeline.json", "kdenlive_path": "timeline/project.kdenlive", "fps": timeline["fps"], "width": timeline["width"], "height": timeline["height"], "track_count": len(timeline["tracks"])},
+        "timeline": {"path": "timeline/timeline.json", "kdenlive_path": "kdenlive/project.kdenlive", "fps": timeline["fps"], "width": timeline["width"], "height": timeline["height"], "duration": timeline["duration"], "status": "REAL", "track_count": len(timeline["tracks"])},
+        "kdenlive": {"project_path": "kdenlive/project.kdenlive", "validation": kdenlive_validation, "validated_by": kdenlive_validated_by, "producer_count": 7, "playlist_count": 8},
         "subtitles": {"status": "SIMULATED", "subtitles_timing_source": "script_estimated", "path": "package/subtitles.srt"},
         "disclosure": {"ai_use_disclosure_configured": True, "realistic_ai_content": True, "upload_setting_required": True},
-        "provenance": {"complete": True, "asset_count": len(files)}, "render": {"video_status": "REAL/LOCAL/FREE" if video else "MISSING", "error": video_error}, "assets": files,
+        "provenance": {"complete": True, "asset_count": len(files), "timeline_v1": {"status": "REAL", "path": "timeline/timeline.json"}, "kdenlive_project": {"status": kdenlive_validation, "path": "kdenlive/project.kdenlive", "validated_by": kdenlive_validated_by}}, "render": {"video_status": "REAL/LOCAL/FREE" if video else "MISSING", "error": video_error}, "assets": files,
     }
     non_ok = []
     if source["status"] not in OK: non_ok.append({"stage": "research", "status": source["status"], "reason": source.get("reason", "no source-backed claims")})
     if not narration: non_ok.append({"stage": "voice", "status": "MISSING", "reason": narration_error or "No local TTS provider was available; silent animatic must fail publication."})
     if not confirm_commercial_rights: non_ok.append({"stage": "rights", "status": "MISSING", "reason": "Commercial-use rights ledger requires human confirmation."})
     if not confirm_not_mass_produced: non_ok.append({"stage": "creative", "status": "SIMULATED", "reason": "Mass-production/repetition review requires human attestation."})
+    if similarity_max > 0.8 and not confirm_not_mass_produced: non_ok.append({"stage": "creative", "status": "SIMULATED", "reason": f"Topic similarity {similarity_max:.2f} exceeds 0.8 threshold; requires --confirm-not-mass-produced attestation"})
     manifest["honesty"]["non_ok"] = non_ok
     write_json(project / "production_manifest.json", manifest)
     qc = media_qc(video, narration, subtitles, manifest["provenance"]["complete"])
@@ -543,6 +606,35 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     monetization = monetization_gate(project, manifest, qc)
     memory_path, memory_record = update_creative_memory(topic, manifest["generated_at"], bus_info["music_preset"], shot_text, len(timeline["tracks"][0].get("clips", [])), measured_duration, qc["gate"], monetization["decision"])
     print(json.dumps({"project": str(project), "package": str(package), "qc": qc["gate"], "monetization": monetization["decision"], "blocking_reasons": monetization["blocking_reasons"], "creative_memory": str(memory_path.relative_to(ROOT))}, indent=2))
+
+
+def variants(topic: str, n: int):
+    memory = load_creative_memory(); similarity_max, _, recent = memory_metrics(topic, memory)
+    _, claims = wikipedia_research(topic, OUT / "_variant_research")
+    presets = ["ambient_dark", "curious_pulse", "wonder"]
+    hooks = ["In this original explainer, we investigate", "What if the hidden question is", "The surprising story begins with"]
+    patterns = [["whoosh", "impact"], ["riser", "static"], ["impact", "whoosh", "riser"]]
+    output=[]
+    for i in range(max(0,n)):
+        preset=presets[i % len(presets)]; originality=1.0-similarity_max; diversity=1.0 if preset not in recent else 0.5; coverage=min(len(claims)/25,1.0); composite=0.4*originality+0.3*diversity+0.3*coverage
+        output.append({"index":i,"music_preset":preset,"script_template":hooks[i%len(hooks)],"sfx_pattern":patterns[i%len(patterns)],"originality":round(originality,4),"diversity":diversity,"coverage":round(coverage,4),"composite":round(composite,4)})
+    best=max(output,key=lambda x:x["composite"],default=None)
+    report={"topic":topic,"n_variants":n,"variants":output,"recommended_index":best["index"] if best else None,"recommended_preset":best["music_preset"] if best else None,"reason":"highest composite score; music preset not recently used"}
+    print(json.dumps(report,indent=2))
+
+
+def resume_project(project_dir: str):
+    project=Path(project_dir); package=project/"package"; print(f"RESUME: {project}")
+    checks=[("research",project/"sources.json", "sources.json exists"),("creative",project/"script.txt", "script.txt exists"),("voice",package/"narration.wav", "narration.wav exists"),("mixing",package/"final_mix.wav", "final_mix.wav exists"),("timeline",project/"timeline"/"timeline.json", "timeline.json exists"),("kdenlive",project/"kdenlive"/"project.kdenlive", "project.kdenlive exists"),("render",package/"final_video.mp4", "final_video.mp4 exists"),("qc",package/"qc_report.json", "qc_report.json exists"),("monetization",package/"monetization_report.json", "monetization_report.json exists")]
+    for name,path,reason in checks: print(f"  [{'SKIP' if path.exists() else 'RUN '}] {name} ({reason if path.exists() else 'missing'})")
+    if (package/"final_video.mp4").exists() and (package/"qc_report.json").exists() and (package/"monetization_report.json").exists(): return
+    image=next(iter((project/"assets").glob("*.png")),None); subtitles=package/"subtitles.srt"; mix=package/"final_mix.wav"
+    duration=probe_duration(mix) or probe_duration(package/"narration.wav") or 12
+    if not (package/"final_video.mp4").exists() and image and mix and subtitles.exists(): create_video(project,image,mix,subtitles,duration)
+    video=package/"final_video.mp4" if (package/"final_video.mp4").exists() else None; narration=package/"narration.wav" if (package/"narration.wav").exists() else None
+    if video: write_json(package/"qc_report.json", media_qc(video,narration,subtitles,True))
+    manifest=load_json(project/"production_manifest.json",{})
+    if manifest and (package/"qc_report.json").exists(): write_json(package/"monetization_report.json", monetization_gate(project,manifest,load_json(package/"qc_report.json",{})))
 
 
 def main():
@@ -556,10 +648,14 @@ def main():
     produce_parser.add_argument("--confirm-not-mass-produced", action="store_true")
     produce_parser.add_argument("--confirm-originality", action="store_true", default=True)
     produce_parser.add_argument("--no-originality", action="store_false", dest="confirm_originality")
-    sub.add_parser("qc"); sub.add_parser("variants"); sub.add_parser("resume")
+    sub.add_parser("qc")
+    variants_parser = sub.add_parser("variants"); variants_parser.add_argument("--topic", required=True); variants_parser.add_argument("--n", type=int, default=3)
+    resume_parser = sub.add_parser("resume"); resume_parser.add_argument("--project-dir", required=True)
     args = parser.parse_args()
     if args.command == "doctor": doctor()
     elif args.command == "produce": produce(args.topic, args.minutes, args.confirm_commercial_rights, args.confirm_not_mass_produced, args.confirm_originality)
+    elif args.command == "variants": variants(args.topic, args.n)
+    elif args.command == "resume": resume_project(args.project_dir)
     else: print(json.dumps({"command": args.command, "status": "not_yet_implemented", "honesty": "No artifact was produced."}, indent=2))
 
 

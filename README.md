@@ -25,7 +25,25 @@ The same timeline is exported to `timeline/project.kdenlive` as MLT XML. The exp
 
 ## Creative memory
 
-Productions append to the persistent repository-level file `memory/creative_memory.json`. Each record stores the topic, timestamp, music preset, script sample, shot count, measured duration, word count, QC gate, and final monetization verdict. This provides an auditable history for future anti-repetition and creative-variation checks without overwriting earlier productions.
+Productions append to the persistent shared file `out/creative_memory.json`. Each record stores the topic, timestamp, music preset, script sample, shot count, measured duration, word count, QC gate, and final monetization verdict. The pipeline computes topic Jaccard similarity, tracks preset usage, rotates away from presets used in the last three productions when possible, and records repetition warnings without pretending that similarity analysis proves originality.
+
+## Variants and resume
+
+Variants mode generates only a scoring report; it does not render video:
+
+```bash
+python3 run.py variants --topic "The Fermi Paradox" --n 3
+```
+
+Each concept varies its opening hook, music preset, and SFX pattern, then scores originality, music diversity, research coverage, and a composite recommendation.
+
+Resume mode reports stage status and reruns missing render, QC, and monetization work while preserving completed artifacts:
+
+```bash
+python3 run.py resume --project-dir out/<project>
+```
+
+Kdenlive output is written to `kdenlive/project.kdenlive`. If `melt` is available, the exporter attempts a null-consumer validation and records `LOCAL` with `validated_by: "melt"` on success. Without `melt`, the XML is retained and honestly marked `SIMULATED`.
 
 ## Monetization gate
 
