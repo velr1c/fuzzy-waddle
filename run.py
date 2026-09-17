@@ -2,6 +2,7 @@
 """Local-first AI YouTube Studio with an explicit monetization gate."""
 from __future__ import annotations
 import argparse, hashlib, json, math, re, shutil, subprocess, time, wave
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -291,6 +292,85 @@ def create_timeline(project: Path, topic: str, duration: float, image: Path | No
     return path, payload
 
 
+def _mlt_timecode(frames):
+    return str(max(0, int(frames)))
+
+
+def write_kdenlive_project(timeline, out_path: Path):
+    """Convert a canonical timeline payload to portable Kdenlive/MLT XML."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    project_root = out_path.parent.parent
+    fps = int(timeline.get("fps", 25)); width = int(timeline.get("width", 1920)); height = int(timeline.get("height", 1080))
+    total_frames = max(1, int(round(float(timeline.get("duration", 1.0)) * fps)))
+    root = ET.Element("mlt", {"LC_NUMERIC": "C", "version": "7.0.0", "producer": "tractor0"})
+    ET.SubElement(root, "profile", {"description": "HD 1080p 25 fps", "width": str(width), "height": str(height), "progressive": "1", "sample_aspect_num": "1", "sample_aspect_den": "1", "display_aspect_num": "16", "display_aspect_den": "9", "frame_rate_num": str(fps), "frame_rate_den": "1", "colorspace": "709"})
+    producers = {}
+    producer_ids = []
+    media_kinds = {"VIDEO", "GRAPHICS", "VOICE", "MUSIC", "SFX", "AMBIENCE"}
+    for track in timeline.get("tracks", []):
+        if track.get("kind") not in media_kinds: continue
+        for clip in track.get("clips", []):
+            src = clip.get("src")
+            if not src: continue
+            key = (src, track.get("kind"))
+            if key in producers: continue
+            pid = f"producer{len(producers)}"; producers[key] = pid; producer_ids.append(pid)
+            absolute = (project_root / src).resolve()
+            service = "qimage" if track.get("kind") in {"VIDEO", "GRAPHICS"} and absolute.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else "avformat"
+            producer = ET.SubElement(root, "producer", {"id": pid})
+            ET.SubElement(producer, "property", {"name": "resource"}).text = str(absolute)
+            ET.SubElement(producer, "property", {"name": "mlt_service"}).text = service
+            ET.SubElement(producer, "property", {"name": "length"}).text = _mlt_timecode(total_frames)
+            if service == "qimage":
+                ET.SubElement(producer, "property", {"name": "ttl"}).text = str(total_frames)
+                ET.SubElement(producer, "property", {"name": "loop"}).text = "1"
+            params = clip.get("params", {})
+            if service == "qimage" and any(k in params for k in ("z0", "z1", "pan")):
+                z0 = float(params.get("z0", 1.0)); z1 = float(params.get("z1", z0)); first_w = width / z0; last_w = width / z1
+                first_x = (width - first_w) / 2; last_x = (width - last_w) / 2
+                geometry = f"0={first_x:.2f}:{(height-height/z0)/2:.2f}:{first_w:.2f}:{height/z0:.2f}:100;{total_frames-1}={last_x:.2f}:{(height-height/z1)/2:.2f}:{last_w:.2f}:{height/z1:.2f}:100"
+                filt = ET.SubElement(producer, "filter")
+                ET.SubElement(filt, "property", {"name": "mlt_service"}).text = "affine"
+                ET.SubElement(filt, "property", {"name": "transition.geometry"}).text = geometry
+    playlist_ids = {}
+    for track in timeline.get("tracks", []):
+        kind = track.get("kind")
+        if kind not in media_kinds: continue
+        plid = f"playlist_{track['id']}"; playlist_ids[kind] = plid
+        playlist = ET.SubElement(root, "playlist", {"id": plid})
+        cursor = 0
+        for clip in sorted(track.get("clips", []), key=lambda x: float(x.get("start", 0))):
+            start = max(0, int(round(float(clip.get("start", 0)) * fps))); frames = max(1, int(round(float(clip.get("duration", 0)) * fps)))
+            if start > cursor: ET.SubElement(playlist, "blank", {"length": _mlt_timecode(start - cursor)})
+            src = clip.get("src"); pid = producers.get((src, kind))
+            if pid:
+                entry = ET.SubElement(playlist, "entry", {"producer": pid, "in": "0", "out": _mlt_timecode(frames - 1)})
+                entry.set("eof", "pause")
+            cursor = start + frames
+        if cursor < total_frames: ET.SubElement(playlist, "blank", {"length": _mlt_timecode(total_frames - cursor)})
+    tractor = ET.SubElement(root, "tractor", {"id": "tractor0", "in": "0", "out": _mlt_timecode(total_frames - 1)})
+    multitrack = ET.SubElement(tractor, "multitrack")
+    ordered = ["VIDEO", "GRAPHICS", "VOICE", "MUSIC", "SFX", "AMBIENCE"]
+    for kind in ordered:
+        if kind in playlist_ids: ET.SubElement(multitrack, "track", {"producer": playlist_ids[kind]})
+    if "GRAPHICS" in playlist_ids:
+        transition = ET.SubElement(tractor, "transition")
+        ET.SubElement(transition, "property", {"name": "a_track"}).text = "0"
+        ET.SubElement(transition, "property", {"name": "b_track"}).text = "1"
+        ET.SubElement(transition, "property", {"name": "mlt_service"}).text = "qtblend"
+        ET.SubElement(transition, "property", {"name": "geometry"}).text = "0=0/0:0/0:1/1:100"
+    for kind in ["VOICE", "MUSIC", "SFX", "AMBIENCE"]:
+        if kind not in playlist_ids: continue
+        transition = ET.SubElement(tractor, "transition")
+        ET.SubElement(transition, "property", {"name": "a_track"}).text = "0"
+        ET.SubElement(transition, "property", {"name": "b_track"}).text = str(ordered.index(kind))
+        ET.SubElement(transition, "property", {"name": "always_active"}).text = "1"
+        ET.SubElement(transition, "property", {"name": "mlt_service"}).text = "mix"
+    ET.indent(root, space="  ")
+    ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
+    return out_path
+
+
 def create_video(project: Path, image: Path | None, mix: Path | None, subtitles: Path, duration=12):
     video = project / "package" / "final_video.mp4"
     if not tool("ffmpeg") or image is None:
@@ -407,6 +487,7 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
     subtitles = package / "subtitles.srt"; write_estimated_srt(shot_text, measured_duration, subtitles)
     final_mix, bus_info = mix_audio_buses(package, measured_duration, narration, topic)
     timeline_path, timeline = create_timeline(project, topic, measured_duration, image, narration, narration_duration, bus_info, subtitles)
+    kdenlive_path = write_kdenlive_project(timeline, project / "timeline" / "project.kdenlive")
     video, video_error = create_video(project, image, final_mix, subtitles, measured_duration)
     files = []
     for path in project.rglob("*"):
@@ -418,7 +499,7 @@ def produce(topic: str, minutes: int, confirm_commercial_rights=False, confirm_n
         "creative": {"originality_attested": bool(confirm_originality), "meaningful_transformation": True, "not_mass_produced": bool(confirm_not_mass_produced), "human_review_required": True, "attested_by_operator": bool(confirm_not_mass_produced)},
         "rights": {"originality_attested": bool(confirm_originality), "commercial_rights_complete": bool(confirm_commercial_rights), "attested_by_operator": bool(confirm_commercial_rights), "rights_policy": "Every external asset requires documented commercial-use rights."},
         "audio": {"narration_present": bool(narration), "narration_status": narration_status, "narration_duration_seconds": narration_duration, "narration_error": narration_error, "music_status": "REAL/LOCAL/FREE", "music_preset": bus_info["music_preset"], "sfx_status": "REAL/LOCAL/FREE", "sfx_events": len(bus_info["sfx_events"]), "ambience_status": "REAL/LOCAL/FREE", "final_mix_path": "package/final_mix.wav", "sidechain_ducking": bus_info["sidechain_ducking"]},
-        "timeline": {"path": "timeline/timeline.json", "fps": timeline["fps"], "width": timeline["width"], "height": timeline["height"], "track_count": len(timeline["tracks"])},
+        "timeline": {"path": "timeline/timeline.json", "kdenlive_path": "timeline/project.kdenlive", "fps": timeline["fps"], "width": timeline["width"], "height": timeline["height"], "track_count": len(timeline["tracks"])},
         "subtitles": {"status": "SIMULATED", "subtitles_timing_source": "script_estimated", "path": "package/subtitles.srt"},
         "disclosure": {"ai_use_disclosure_configured": True, "realistic_ai_content": True, "upload_setting_required": True},
         "provenance": {"complete": True, "asset_count": len(files)}, "render": {"video_status": "REAL/LOCAL/FREE" if video else "MISSING", "error": video_error}, "assets": files,

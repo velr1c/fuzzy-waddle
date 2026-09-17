@@ -21,6 +21,8 @@ The audio stage now creates four buses without external Python audio dependencie
 
 Each production now writes `timeline/timeline.json` as the single source of truth. It contains eight tracks—`VIDEO`, `GRAPHICS`, `VOICE`, `MUSIC`, `SFX`, `AMBIENCE`, `SUBTITLES`, and `TRANSITIONS`—with source-relative clip references, measured narration timing when available, 25 fps, and a 1920x1080 canvas. Individual bus artifacts are retained alongside `final_mix.wav` so later renderers can rebuild or inspect the mix.
 
+The same timeline is exported to `timeline/project.kdenlive` as MLT XML. The export includes an HD 1080p/25 fps profile, `qimage` and `avformat` producers, per-track playlists, a tractor/multitrack, `mix` transitions for audio tracks, `qtblend` graphics compositing, and `affine` keyframed geometry for slow push-in camera movement.
+
 ## Monetization gate
 
 A package is marked `ELIGIBLE_FOR_HUMAN_REVIEW` only when originality is attested, commercial-use rights are complete, provenance is complete, the work has meaningful transformation, the project is not marked mass-produced, AI disclosure is configured, narration is present, research sources exist, and QC passes. Otherwise it is marked `NOT_ELIGIBLE` with explicit blocking reasons.
